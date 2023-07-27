@@ -405,7 +405,7 @@ func (a *StaticAutoscaler) RunOnce(currentTime time.Time) caerrors.AutoscalerErr
 	unregisteredNodes := a.clusterStateRegistry.GetUnregisteredNodes()
 	if len(unregisteredNodes) > 0 {
 		klog.V(1).Infof("%d unregistered nodes present", len(unregisteredNodes))
-		removedAny, err := removeOldUnregisteredNodes(unregisteredNodes, autoscalingContext,
+		removedAny, err := a.removeOldUnregisteredNodes(unregisteredNodes, autoscalingContext,
 			a.clusterStateRegistry, currentTime, autoscalingContext.LogRecorder)
 		// There was a problem with removing unregistered nodes. Retry in the next loop.
 		if err != nil {
@@ -723,51 +723,83 @@ func fixNodeGroupSize(context *context.AutoscalingContext, clusterStateRegistry 
 }
 
 // Removes unregistered nodes if needed. Returns true if anything was removed and error if such occurred.
-func removeOldUnregisteredNodes(unregisteredNodes []clusterstate.UnregisteredNode, context *context.AutoscalingContext,
+func (a *StaticAutoscaler) removeOldUnregisteredNodes(unregisteredNodes []clusterstate.UnregisteredNode, context *context.AutoscalingContext,
 	csr *clusterstate.ClusterStateRegistry, currentTime time.Time, logRecorder *utils.LogEventRecorder) (bool, error) {
-	removedAny := false
-	for _, unregisteredNode := range unregisteredNodes {
-		nodeGroup, err := context.CloudProvider.NodeGroupForNode(unregisteredNode.Node)
+
+	nodeGroups := a.nodeGroupsById()
+	nodesToBeDeletedByNodeGroupId := make(map[string][]clusterstate.UnregisteredNode)
+	for _, un := range unregisteredNodes {
+		nodeGroup, err := a.CloudProvider.NodeGroupForNode(un.Node)
 		if err != nil {
-			klog.Warningf("Failed to get node group for %s: %v", unregisteredNode.Node.Name, err)
-			return removedAny, err
-		}
-		if nodeGroup == nil || reflect.ValueOf(nodeGroup).IsNil() {
-			klog.Warningf("No node group for node %s, skipping", unregisteredNode.Node.Name)
+			id := "<nil>"
+			if un.Node != nil {
+				id = un.Node.Spec.ProviderID
+			}
+			klog.Warningf("Cannot determine nodeGroup for node %v; %v", id, err)
 			continue
 		}
 
 		maxNodeProvisionTime, err := csr.MaxNodeProvisionTime(nodeGroup)
 		if err != nil {
-			return removedAny, fmt.Errorf("failed to retrieve maxNodeProvisionTime for node %s in nodeGroup %s", unregisteredNode.Node.Name, nodeGroup.Id())
+			return false, fmt.Errorf("failed to retrieve maxNodeProvisionTime for node %s in nodeGroup %s", un.Node.Name, nodeGroup.Id())
 		}
 
-		if unregisteredNode.UnregisteredSince.Add(maxNodeProvisionTime).Before(currentTime) {
-			klog.V(0).Infof("Removing unregistered node %v", unregisteredNode.Node.Name)
-			size, err := nodeGroup.TargetSize()
-			if err != nil {
-				klog.Warningf("Failed to get node group size; unregisteredNode=%v; nodeGroup=%v; err=%v", unregisteredNode.Node.Name, nodeGroup.Id(), err)
-				continue
+		if un.UnregisteredSince.Add(maxNodeProvisionTime).Before(currentTime) {
+			if nodeGroup == nil || reflect.ValueOf(nodeGroup).IsNil() {
+				a.clusterStateRegistry.RefreshCloudProviderNodeInstancesCache()
+				return false, fmt.Errorf("node %s has no known nodegroup", un.Node.GetName())
 			}
-			if nodeGroup.MinSize() >= size {
-				klog.Warningf("Failed to remove node %s: node group min size reached, skipping unregistered node removal", unregisteredNode.Node.Name)
-				continue
-			}
-			err = nodeGroup.DeleteNodes([]*apiv1.Node{unregisteredNode.Node})
-			csr.InvalidateNodeInstancesCacheEntry(nodeGroup)
-			if err != nil {
-				klog.Warningf("Failed to remove node %s: %v", unregisteredNode.Node.Name, err)
-				logRecorder.Eventf(apiv1.EventTypeWarning, "DeleteUnregisteredFailed",
-					"Failed to remove node %s: %v", unregisteredNode.Node.Name, err)
-				return removedAny, err
-			}
-			logRecorder.Eventf(apiv1.EventTypeNormal, "DeleteUnregistered",
-				"Removed unregistered node %v", unregisteredNode.Node.Name)
-			metrics.RegisterOldUnregisteredNodesRemoved(1)
-			removedAny = true
+			nodesToBeDeletedByNodeGroupId[nodeGroup.Id()] = append(nodesToBeDeletedByNodeGroupId[nodeGroup.Id()], un)
 		}
 	}
+
+	removedAny := false
+	for nodeGroupId, nodesToDelete := range nodesToBeDeletedByNodeGroupId {
+		nodeGroup := nodeGroups[nodeGroupId]
+
+		klog.V(0).Infof("Removing %v unregistered nodes for node group %v", len(nodesToDelete), nodeGroupId)
+		size, err := nodeGroup.TargetSize()
+		if err != nil {
+			klog.Warningf("Failed to get node group size; nodeGroup=%v; err=%v", nodeGroup.Id(), err)
+			continue
+		}
+		roomToDelete := size - nodeGroup.MinSize()
+		if roomToDelete < 0 {
+			roomToDelete = 0
+		}
+		if len(nodesToDelete) > roomToDelete {
+			klog.Warningf("Node group %s min size reached, removing only %v out of %v unregistered nodes", nodeGroupId, len(nodesToDelete), roomToDelete)
+			nodesToDelete = nodesToDelete[:roomToDelete]
+			if roomToDelete == 0 {
+				continue
+			}
+		}
+		err = a.deleteFailedNodes(nodeGroup, toNodes(unregisteredNodes))
+		csr.InvalidateNodeInstancesCacheEntry(nodeGroup)
+		if err != nil {
+			klog.Warningf("Failed to remove %v unregistered nodes from node group %s: %v", len(nodesToDelete), nodeGroupId, err)
+			for _, unregisteredNode := range nodesToDelete {
+				logRecorder.Eventf(apiv1.EventTypeWarning, "DeleteUnregisteredFailed",
+					"Failed to remove node %s: %v", unregisteredNode.Node.Name, err)
+			}
+			return removedAny, err
+		}
+		for _, unregisteredNode := range nodesToDelete {
+			logRecorder.Eventf(apiv1.EventTypeNormal, "DeleteUnregistered",
+				"Removed unregistered node %v", unregisteredNode.Node.Name)
+		}
+		metrics.RegisterOldUnregisteredNodesRemoved(len(unregisteredNodes))
+		removedAny = true
+	}
 	return removedAny, nil
+}
+
+func toNodes(unregisteredNodes []clusterstate.UnregisteredNode) []*apiv1.Node {
+	nodes := []*apiv1.Node{}
+	for _, n := range unregisteredNodes {
+		nodes = append(nodes, n.Node)
+	}
+	return nodes
 }
 
 func (a *StaticAutoscaler) deleteCreatedNodesWithErrors() (bool, error) {
@@ -805,7 +837,7 @@ func (a *StaticAutoscaler) deleteCreatedNodesWithErrors() (bool, error) {
 		if nodeGroup == nil {
 			err = fmt.Errorf("node group %s not found", nodeGroupId)
 		} else {
-			err = nodeGroup.DeleteNodes(nodesToBeDeleted)
+			err = a.deleteFailedNodes(nodeGroup, nodesToBeDeleted)
 		}
 
 		if err != nil {
@@ -817,6 +849,33 @@ func (a *StaticAutoscaler) deleteCreatedNodesWithErrors() (bool, error) {
 	}
 
 	return deletedAny, nil
+}
+
+func (a *StaticAutoscaler) deleteFailedNodes(nodeGroup cloudprovider.NodeGroup, nodes []*apiv1.Node) error {
+	opts, err := nodeGroup.GetOptions(a.NodeGroupDefaults)
+	if err != nil {
+		return err
+	}
+	// If a scale-up of "ZeroOrMaxNodeScaling" node group failed, the cleanup
+	// should stick to the all-or-nothing principle. Deleting all nodes.
+	if opts != nil && opts.ZeroOrMaxNodeScaling {
+		instances, err := nodeGroup.Nodes()
+		if err != nil {
+			return err
+		}
+		nodes = instancesToFakeNodes(instances)
+	}
+	return nodeGroup.DeleteNodes(nodes)
+}
+
+// instancesToNodes returns a list of fake nodes with just names populated,
+// so that they can be passed as nodes to delete
+func instancesToFakeNodes(instances []cloudprovider.Instance) []*apiv1.Node {
+	nodes := []*apiv1.Node{}
+	for _, i := range instances {
+		nodes = append(nodes, clusterstate.FakeNode(i, ""))
+	}
+	return nodes
 }
 
 func (a *StaticAutoscaler) nodeGroupsById() map[string]cloudprovider.NodeGroup {

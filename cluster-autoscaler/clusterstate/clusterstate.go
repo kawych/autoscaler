@@ -53,6 +53,7 @@ var (
 type maxNodeProvisionTimeProvider interface {
 	// GetMaxNodeProvisionTime returns MaxNodeProvisionTime value that should be used for the given NodeGroup.
 	GetMaxNodeProvisionTime(nodeGroup cloudprovider.NodeGroup) (time.Duration, error)
+	//GetMaxNodeStartupTime(instance cloudprovider.Instance)
 }
 
 // ScaleUpRequest contains information about the requested node group scale up.
@@ -1010,7 +1011,7 @@ func getNotRegisteredNodes(allNodes []*apiv1.Node, cloudProviderNodeInstances ma
 		for _, instance := range instances {
 			if !registered.Has(instance.Id) && expectedToRegister(instance) {
 				notRegistered = append(notRegistered, UnregisteredNode{
-					Node:              fakeNode(instance, cloudprovider.FakeNodeUnregistered),
+					Node:              FakeNode(instance, cloudprovider.FakeNodeUnregistered),
 					UnregisteredSince: time,
 				})
 			}
@@ -1191,7 +1192,7 @@ func (csr *ClusterStateRegistry) GetCreatedNodesWithErrors() []*apiv1.Node {
 		_, _, instancesByErrorCode := csr.buildInstanceToErrorCodeMappings(nodeGroupInstances)
 		for _, instances := range instancesByErrorCode {
 			for _, instance := range instances {
-				nodesWithCreateErrors = append(nodesWithCreateErrors, fakeNode(instance, cloudprovider.FakeNodeCreateError))
+				nodesWithCreateErrors = append(nodesWithCreateErrors, FakeNode(instance, cloudprovider.FakeNodeCreateError))
 			}
 		}
 	}
@@ -1208,7 +1209,8 @@ func (csr *ClusterStateRegistry) InvalidateNodeInstancesCacheEntry(nodeGroup clo
 	csr.cloudProviderNodeInstancesCache.InvalidateCacheEntry(nodeGroup)
 }
 
-func fakeNode(instance cloudprovider.Instance, reason string) *apiv1.Node {
+// FakeNode creates a fake node with Name field populated and FakeNodeReasonAnnotation added
+func FakeNode(instance cloudprovider.Instance, reason string) *apiv1.Node {
 	return &apiv1.Node{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: instance.Id,

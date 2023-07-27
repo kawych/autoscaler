@@ -1584,13 +1584,18 @@ func TestRemoveOldUnregisteredNodes(t *testing.T) {
 	unregisteredNodes := clusterState.GetUnregisteredNodes()
 	assert.Equal(t, 1, len(unregisteredNodes))
 
+	autoscaler := &StaticAutoscaler{
+		AutoscalingContext:   context,
+		clusterStateRegistry: clusterState,
+	}
+
 	// Nothing should be removed. The unregistered node is not old enough.
-	removed, err := removeOldUnregisteredNodes(unregisteredNodes, context, clusterState, now.Add(-50*time.Minute), fakeLogRecorder)
+	removed, err := autoscaler.removeOldUnregisteredNodes(unregisteredNodes, context, clusterState, now.Add(-50*time.Minute), fakeLogRecorder)
 	assert.NoError(t, err)
 	assert.False(t, removed)
 
 	// ng1_2 should be removed.
-	removed, err = removeOldUnregisteredNodes(unregisteredNodes, context, clusterState, now, fakeLogRecorder)
+	removed, err = autoscaler.removeOldUnregisteredNodes(unregisteredNodes, context, clusterState, now, fakeLogRecorder)
 	assert.NoError(t, err)
 	assert.True(t, removed)
 	deletedNode := core_utils.GetStringFromChan(deletedNodes)
