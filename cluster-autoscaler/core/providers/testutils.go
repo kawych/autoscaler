@@ -14,12 +14,14 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-package clusterstate
+package providers
 
 import (
 	"time"
 
 	"k8s.io/autoscaler/cluster-autoscaler/cloudprovider"
+	"k8s.io/autoscaler/cluster-autoscaler/context"
+	"k8s.io/autoscaler/cluster-autoscaler/processors/nodegroupconfig"
 )
 
 // NewMockMaxNodeProvisionTimeProvider returns static maxNodeProvisionTimeProvider which returns constant MaxNodeProvisionTime for every NodeGroup.
@@ -29,6 +31,9 @@ func NewMockMaxNodeProvisionTimeProvider(maxNodeProvisionTime time.Duration) *st
 
 type staticMockMaxNodeProvisionTimeProvider struct {
 	staticMaxNodeProvisionTime time.Duration
+}
+
+func (p *staticMockMaxNodeProvisionTimeProvider) Initialize(context *context.AutoscalingContext, nodeGroupConfigProcessor nodegroupconfig.NodeGroupConfigProcessor) {
 }
 
 // GetMaxNodeProvisionTime returns constant MaxNodeProvisionTime value that should be used for every NodeGroup.

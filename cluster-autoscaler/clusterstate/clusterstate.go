@@ -50,10 +50,11 @@ var (
 	errMaxNodeProvisionTimeProviderNotSet = errors.New("MaxNodeProvisionTimeProvider was not set in cluster state")
 )
 
-type maxNodeProvisionTimeProvider interface {
-	// GetMaxNodeProvisionTime returns MaxNodeProvisionTime value that should be used for the given NodeGroup.
+type MaxNodeProvisionTimeProvider interface {
+	// GetMaxNodeProvisionTime is a time a node has to register since its creation started
 	GetMaxNodeProvisionTime(nodeGroup cloudprovider.NodeGroup) (time.Duration, error)
-	//GetMaxNodeStartupTime(instance cloudprovider.Instance)
+	// GetMaxInstanceRegistrationTime is a time a node has to register, starting from when its creation finished
+	GetMaxInstanceRegistrationTime(nodeGroup cloudprovider.NodeGroup) (time.Duration, error)
 }
 
 // ScaleUpRequest contains information about the requested node group scale up.
@@ -106,8 +107,10 @@ type IncorrectNodeGroupSize struct {
 type UnregisteredNode struct {
 	// Node is a dummy node that contains only the name of the node.
 	Node *apiv1.Node
-	// UnregisteredSince is the time when the node was first spotted.
-	UnregisteredSince time.Time
+	// ProvisioningStartTime is the time when the node was first spotted.
+	ProvisioningStartTime time.Time
+	// ProvisionedTime is the time when the node was provisioned and should start installation.
+	ProvisionedTime time.Time
 }
 
 // ScaleUpFailure contains information about a failure of a scale-up.
@@ -141,7 +144,7 @@ type ClusterStateRegistry struct {
 	previousCloudProviderNodeInstances map[string][]cloudprovider.Instance
 	cloudProviderNodeInstancesCache    *utils.CloudProviderNodeInstancesCache
 	interrupt                          chan struct{}
-	maxNodeProvisionTimeProvider       maxNodeProvisionTimeProvider
+	maxNodeProvisionTimeProvider       MaxNodeProvisionTimeProvider
 
 	// scaleUpFailures contains information about scale-up failures for each node group. It should be
 	// cleared periodically to avoid unnecessary accumulation.
@@ -149,7 +152,7 @@ type ClusterStateRegistry struct {
 }
 
 // NewClusterStateRegistry creates new ClusterStateRegistry.
-func NewClusterStateRegistry(cloudProvider cloudprovider.CloudProvider, config ClusterStateRegistryConfig, logRecorder *utils.LogEventRecorder, backoff backoff.Backoff) *ClusterStateRegistry {
+func NewClusterStateRegistry(cloudProvider cloudprovider.CloudProvider, config ClusterStateRegistryConfig, logRecorder *utils.LogEventRecorder, backoff backoff.Backoff, maxNodeProvisionTimeProvider MaxNodeProvisionTimeProvider) *ClusterStateRegistry {
 	emptyStatus := &api.ClusterAutoscalerStatus{
 		ClusterwideConditions: make([]api.ClusterAutoscalerCondition, 0),
 		NodeGroupStatuses:     make([]api.NodeGroupStatus, 0),
@@ -173,6 +176,7 @@ func NewClusterStateRegistry(cloudProvider cloudprovider.CloudProvider, config C
 		cloudProviderNodeInstancesCache: utils.NewCloudProviderNodeInstancesCache(cloudProvider),
 		interrupt:                       make(chan struct{}),
 		scaleUpFailures:                 make(map[string][]ScaleUpFailure),
+		maxNodeProvisionTimeProvider:    maxNodeProvisionTimeProvider,
 	}
 }
 
@@ -198,21 +202,24 @@ func (csr *ClusterStateRegistry) RegisterOrUpdateScaleUp(nodeGroup cloudprovider
 	csr.registerOrUpdateScaleUpNoLock(nodeGroup, delta, currentTime)
 }
 
-// RegisterProviders registers providers in the cluster state registry.
-func (csr *ClusterStateRegistry) RegisterProviders(maxNodeProvisionTimeProvider maxNodeProvisionTimeProvider) {
-	csr.maxNodeProvisionTimeProvider = maxNodeProvisionTimeProvider
-}
-
-// MaxNodeProvisionTime returns MaxNodeProvisionTime value that should be used for the given NodeGroup.
-func (csr *ClusterStateRegistry) MaxNodeProvisionTime(nodeGroup cloudprovider.NodeGroup) (time.Duration, error) {
+// GetProvisioningTimeouts returns end-to-end, just creation and just installation timeouts defined for this node group.
+func (csr *ClusterStateRegistry) GetProvisioningTimeouts(nodeGroup cloudprovider.NodeGroup) (endToEnd, registration time.Duration, err error) {
 	if csr.maxNodeProvisionTimeProvider == nil {
-		return 0, errMaxNodeProvisionTimeProviderNotSet
+		return 0, 0, errMaxNodeProvisionTimeProviderNotSet
 	}
-	return csr.maxNodeProvisionTimeProvider.GetMaxNodeProvisionTime(nodeGroup)
+	endToEnd, err = csr.maxNodeProvisionTimeProvider.GetMaxNodeProvisionTime(nodeGroup)
+	if err != nil {
+		return 0, 0, err
+	}
+	registration, err = csr.maxNodeProvisionTimeProvider.GetMaxInstanceRegistrationTime(nodeGroup)
+	if err != nil {
+		return 0, 0, err
+	}
+	return endToEnd, registration, nil
 }
 
 func (csr *ClusterStateRegistry) registerOrUpdateScaleUpNoLock(nodeGroup cloudprovider.NodeGroup, delta int, currentTime time.Time) {
-	maxNodeProvisionTime, err := csr.MaxNodeProvisionTime(nodeGroup)
+	maxNodeProvisionTime, _, err := csr.GetProvisioningTimeouts(nodeGroup)
 	if err != nil {
 		klog.Warningf("Couldn't update scale up request: failed to get maxNodeProvisionTime for node group %s: %w", nodeGroup.Id(), err)
 		return
@@ -272,6 +279,13 @@ func (csr *ClusterStateRegistry) updateScaleRequests(currentTime time.Time) {
 				nodeGroupName, currentTime.Sub(scaleUpRequest.Time))
 			continue
 		}
+		_, registrationTime, err := csr.GetProvisioningTimeouts(scaleUpRequest.NodeGroup)
+		if err != nil {
+			klog.Warningf("failed to retrieve max node registering time for nodeGroup %s", nodeGroupName)
+			continue
+		} else if csr.allInstancesAreCreated(nodeGroupName) && currentTime.Add(registrationTime).Before(scaleUpRequest.ExpectedAddTime) {
+			scaleUpRequest.ExpectedAddTime = currentTime.Add(registrationTime)
+		}
 
 		if scaleUpRequest.ExpectedAddTime.Before(currentTime) {
 			klog.Warningf("Scale-up timed out for node group %v after %v",
@@ -299,6 +313,15 @@ func (csr *ClusterStateRegistry) updateScaleRequests(currentTime time.Time) {
 		}
 	}
 	csr.scaleDownRequests = newScaleDownRequests
+}
+
+func (csr *ClusterStateRegistry) allInstancesAreCreated(nodeGroupId string) bool {
+	for _, un := range csr.unregisteredNodes {
+		if un.ProvisionedTime == (time.Time{}) {
+			return false
+		}
+	}
+	return true
 }
 
 // To be executed under a lock.
@@ -626,12 +649,11 @@ func (csr *ClusterStateRegistry) updateReadinessStats(currentTime time.Time) {
 			continue
 		}
 		perNgCopy := perNodeGroup[nodeGroup.Id()]
-		maxNodeProvisionTime, err := csr.MaxNodeProvisionTime(nodeGroup)
+		shouldRegister, err := csr.ShouldRegisterByNow(nodeGroup, unregistered, currentTime)
 		if err != nil {
-			klog.Warningf("Failed to get maxNodeProvisionTime for node %s in node group %s: %w", unregistered.Node.Name, nodeGroup.Id(), err)
 			continue
 		}
-		if unregistered.UnregisteredSince.Add(maxNodeProvisionTime).Before(currentTime) {
+		if shouldRegister {
 			perNgCopy.LongUnregistered = append(perNgCopy.LongUnregistered, unregistered.Node.Name)
 			total.LongUnregistered = append(total.LongUnregistered, unregistered.Node.Name)
 		} else {
@@ -694,6 +716,9 @@ func (csr *ClusterStateRegistry) updateUnregisteredNodes(unregisteredNodes []Unr
 	result := make(map[string]UnregisteredNode)
 	for _, unregistered := range unregisteredNodes {
 		if prev, found := csr.unregisteredNodes[unregistered.Node.Name]; found {
+			//if prev.ProvisionedTime == (time.Time{}) {
+			//	prev.ProvisionedTime = unregistered.ProvisionedTime
+			//}
 			result[unregistered.Node.Name] = prev
 		} else {
 			result[unregistered.Node.Name] = unregistered
@@ -1011,8 +1036,9 @@ func getNotRegisteredNodes(allNodes []*apiv1.Node, cloudProviderNodeInstances ma
 		for _, instance := range instances {
 			if !registered.Has(instance.Id) && expectedToRegister(instance) {
 				notRegistered = append(notRegistered, UnregisteredNode{
-					Node:              FakeNode(instance, cloudprovider.FakeNodeUnregistered),
-					UnregisteredSince: time,
+					Node:                  FakeNode(instance, cloudprovider.FakeNodeUnregistered),
+					ProvisioningStartTime: time,
+					//ProvisionedTime:       provisionedTime(instance, time),
 				})
 			}
 		}
@@ -1022,6 +1048,13 @@ func getNotRegisteredNodes(allNodes []*apiv1.Node, cloudProviderNodeInstances ma
 
 func expectedToRegister(instance cloudprovider.Instance) bool {
 	return instance.Status != nil && instance.Status.State != cloudprovider.InstanceDeleting && instance.Status.ErrorInfo == nil
+}
+
+func provisionedTime(instance cloudprovider.Instance, currentTime time.Time) time.Time {
+	if instance.Status != nil && instance.Status.State == cloudprovider.InstanceRunning {
+		return currentTime
+	}
+	return time.Time{}
 }
 
 // Calculates which of the registered nodes in Kubernetes that do not exist in cloud provider.
@@ -1247,4 +1280,31 @@ func (csr *ClusterStateRegistry) GetScaleUpFailures() map[string][]ScaleUpFailur
 		result[nodeGroupId] = failures
 	}
 	return result
+}
+
+func (csr *ClusterStateRegistry) ShouldRegisterByNow(nodeGroup cloudprovider.NodeGroup, un UnregisteredNode, currentTime time.Time) (bool, error) {
+	endToEndTime, _, err := csr.GetProvisioningTimeouts(nodeGroup)
+	if err != nil {
+		return false, fmt.Errorf("failed to retrieve maxNodeProvisionTime for node %s in nodeGroup %s", un.Node.Name, nodeGroup.Id())
+	}
+	if un.ProvisioningStartTime.Add(endToEndTime).Before(currentTime) {
+		return true, nil
+	}
+	return false, nil
+	//return un.ProvisionedTime != (time.Time{}) &&
+	//	un.ProvisionedTime.Add(registrationTime).Before(currentTime), nil
+}
+
+func (csr *ClusterStateRegistry) GetAllNodesForGroup(nodeGroupId string) ([]*apiv1.Node, error) {
+	nodes := []*apiv1.Node{}
+	for _, n := range csr.nodes {
+		nodeGroup, err := csr.cloudProvider.NodeGroupForNode(n)
+		if err != nil {
+			return nil, err
+		}
+		if nodeGroup.Id() == nodeGroupId {
+			nodes = append(nodes, n)
+		}
+	}
+	return nodes, nil
 }

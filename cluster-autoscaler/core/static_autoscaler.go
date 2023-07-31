@@ -24,6 +24,7 @@ import (
 
 	apiv1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/autoscaler/cluster-autoscaler/core/providers"
 	"k8s.io/autoscaler/cluster-autoscaler/core/scaledown/pdb"
 	"k8s.io/autoscaler/cluster-autoscaler/core/scaledown/planner"
 	scaledownstatus "k8s.io/autoscaler/cluster-autoscaler/core/scaledown/status"
@@ -35,7 +36,6 @@ import (
 
 	"k8s.io/autoscaler/cluster-autoscaler/cloudprovider"
 	"k8s.io/autoscaler/cluster-autoscaler/clusterstate"
-	"k8s.io/autoscaler/cluster-autoscaler/clusterstate/providers"
 	"k8s.io/autoscaler/cluster-autoscaler/clusterstate/utils"
 	"k8s.io/autoscaler/cluster-autoscaler/config"
 	"k8s.io/autoscaler/cluster-autoscaler/context"
@@ -142,13 +142,14 @@ func NewStaticAutoscaler(
 	debuggingSnapshotter debuggingsnapshot.DebuggingSnapshotter,
 	remainingPdbTracker pdb.RemainingPdbTracker,
 	scaleUpOrchestrator scaleup.Orchestrator,
-	deleteOptions simulator.NodeDeleteOptions) *StaticAutoscaler {
+	deleteOptions simulator.NodeDeleteOptions,
+	maxNodeProvisionTimeProvider providers.MaxNodeProvisionTimeProvider) *StaticAutoscaler {
 
 	clusterStateConfig := clusterstate.ClusterStateRegistryConfig{
 		MaxTotalUnreadyPercentage: opts.MaxTotalUnreadyPercentage,
 		OkTotalUnreadyCount:       opts.OkTotalUnreadyCount,
 	}
-	clusterStateRegistry := clusterstate.NewClusterStateRegistry(cloudProvider, clusterStateConfig, autoscalingKubeClients.LogRecorder, backoff)
+	clusterStateRegistry := clusterstate.NewClusterStateRegistry(cloudProvider, clusterStateConfig, autoscalingKubeClients.LogRecorder, backoff, maxNodeProvisionTimeProvider)
 	processorCallbacks := newStaticAutoscalerProcessorCallbacks()
 	autoscalingContext := context.NewAutoscalingContext(
 		opts,
@@ -164,7 +165,7 @@ func NewStaticAutoscaler(
 		clusterStateRegistry)
 
 	taintConfig := taints.NewTaintConfig(opts)
-	clusterStateRegistry.RegisterProviders(providers.NewDefaultMaxNodeProvisionTimeProvider(autoscalingContext, processors.NodeGroupConfigProcessor))
+	maxNodeProvisionTimeProvider.Initialize(autoscalingContext, processors.NodeGroupConfigProcessor)
 	processors.ScaleDownCandidatesNotifier.Register(clusterStateRegistry)
 
 	// TODO: Populate the ScaleDownActuator/Planner fields in AutoscalingContext
@@ -701,7 +702,7 @@ func fixNodeGroupSize(context *context.AutoscalingContext, clusterStateRegistry 
 		if incorrectSize == nil {
 			continue
 		}
-		maxNodeProvisionTime, err := clusterStateRegistry.MaxNodeProvisionTime(nodeGroup)
+		maxNodeProvisionTime, _, err := clusterStateRegistry.GetProvisioningTimeouts(nodeGroup)
 		if err != nil {
 			return false, fmt.Errorf("failed to retrieve maxNodeProvisionTime for nodeGroup %s", nodeGroup.Id())
 		}
@@ -739,12 +740,11 @@ func (a *StaticAutoscaler) removeOldUnregisteredNodes(unregisteredNodes []cluste
 			continue
 		}
 
-		maxNodeProvisionTime, err := csr.MaxNodeProvisionTime(nodeGroup)
+		shouldRegister, err := a.clusterStateRegistry.ShouldRegisterByNow(nodeGroup, un, currentTime)
 		if err != nil {
-			return false, fmt.Errorf("failed to retrieve maxNodeProvisionTime for node %s in nodeGroup %s", un.Node.Name, nodeGroup.Id())
+			return false, err
 		}
-
-		if un.UnregisteredSince.Add(maxNodeProvisionTime).Before(currentTime) {
+		if shouldRegister {
 			if nodeGroup == nil || reflect.ValueOf(nodeGroup).IsNil() {
 				a.clusterStateRegistry.RefreshCloudProviderNodeInstancesCache()
 				return false, fmt.Errorf("node %s has no known nodegroup", un.Node.GetName())
