@@ -51,15 +51,13 @@ func (p *PostFilteringScaleDownNodeProcessor) filterOutIncompleteAtomicNodeGroup
 	for _, node := range nodes {
 		nodeGroup, err := ctx.CloudProvider.NodeGroupForNode(node.Node)
 		if err != nil {
-			klog.Errorf("Node %v will not scale down, failed to get node info: %s", node.Node.Name, err)
-			continue
+			klog.Errorf("Failed to get node info for node %s, skipping atomic groups filtering: %s", node.Node.Name, err)
 		}
 		autoscalingOptions, err := nodeGroup.GetOptions(ctx.NodeGroupDefaults)
 		if err != nil && err != cloudprovider.ErrNotImplemented {
-			klog.Errorf("Failed to get autoscaling options for node group %s: %v", nodeGroup.Id(), err)
-			continue
+			klog.Errorf("Failed to get autoscaling options for node group %s, skipping atomic groups filtering: %v", nodeGroup.Id(), err)
 		}
-		if autoscalingOptions != nil && autoscalingOptions.ZeroOrMaxNodeScaling {
+		if err == nil && autoscalingOptions != nil && autoscalingOptions.ZeroOrMaxNodeScaling {
 			klog.V(2).Infof("Considering node %s for atomic scale down", node.Node.Name)
 			nodesByGroup[nodeGroup] = append(nodesByGroup[nodeGroup], node)
 		} else {
