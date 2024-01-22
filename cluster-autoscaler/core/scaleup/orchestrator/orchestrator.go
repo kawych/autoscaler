@@ -160,8 +160,9 @@ func (o *ScaleUpOrchestrator) ScaleUp(
 	// Finalize binpacking limiter.
 	o.processors.BinpackingLimiter.FinalizeBinpacking(o.autoscalingContext, options)
 
+	
+	klog.V(1).Infof("%v expansion options", len(options))
 	if len(options) == 0 {
-		klog.V(1).Info("No expansion options")
 		return &status.ScaleUpStatus{
 			Result:                  status.ScaleUpNoOptionsAvailable,
 			PodsRemainUnschedulable: GetRemainingPods(podEquivalenceGroups, skippedNodeGroups),
